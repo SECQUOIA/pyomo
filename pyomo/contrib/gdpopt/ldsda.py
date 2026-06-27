@@ -91,6 +91,18 @@ ExternalVarInfo = namedtuple(
     ],
 )
 
+SubproblemResult = namedtuple(
+    'SubproblemResult',
+    [
+        'external_var_value',
+        'feasible',
+        'solver_bound',
+        'model_objective',
+        'continuous_soln',
+        'boolean_soln',
+    ],
+)
+
 
 @SolverFactory.register(
     'gdpopt.ldsda',
@@ -219,11 +231,7 @@ class GDP_LDSDA_Solver(_GDPoptAlgorithm):
 
     def _solve_GDP_subproblem(self, external_var_value, search_type, config):
         """
-        Solve the GDP subproblem with disjunctions fixed according to the external variable values.
-
-        This method fixes the Boolean variables based on the `external_var_value`,
-        applies necessary transformations (BigM, FBBT), and solves the resulting
-        MINLP/NLP using the configured solver.
+        Evaluate a GDP subproblem and integrate its result into solver state.
 
         Parameters
         ----------
@@ -244,8 +252,25 @@ class GDP_LDSDA_Solver(_GDPoptAlgorithm):
             The objective value (primal bound) obtained from the subproblem.
             Returns None if the subproblem was infeasible.
         """
-        self.fix_disjunctions_with_external_var(external_var_value)
+        self.explored_point_set.add(tuple(external_var_value))
+        result = self._build_and_solve_subproblem(external_var_value, config)
+        return self._integrate_subproblem_result(result, search_type, config)
+
+    def _build_and_solve_subproblem(self, external_var_value, config):
+        """
+        Build and solve an isolated subproblem for one external-variable point.
+
+        This method is the worker side of LDSDA subproblem evaluation. It clones
+        ``self.working_model``, fixes disjunctions on the clone, solves that
+        isolated subproblem, and returns plain data for the coordinator to
+        integrate. It does not update explored points, bounds, incumbents, or
+        logging state on ``self``.
+        """
         subproblem = self.working_model.clone()
+        subproblem_util_block = subproblem.component(
+            self.working_model_util_block.local_name
+        )
+        self._fix_disjunctions_on_util_block(subproblem_util_block, external_var_value)
         TransformationFactory('core.logical_to_linear').apply_to(subproblem)
 
         with SuppressInfeasibleWarning():
@@ -260,24 +285,93 @@ class GDP_LDSDA_Solver(_GDPoptAlgorithm):
                     'contrib.deactivate_trivial_constraints'
                 ).apply_to(subproblem, tmp=False, ignore_infeasible=False)
             except InfeasibleConstraintException:
-                return False, None
+                return self._infeasible_subproblem_result(external_var_value)
+
             minlp_args = dict(config.minlp_solver_args)
             if config.time_limit is not None and config.minlp_solver == 'gams':
                 elapsed = get_main_elapsed_time(self.timing)
                 remaining = max(config.time_limit - elapsed, 1)
                 minlp_args['add_options'] = minlp_args.get('add_options', [])
                 minlp_args['add_options'].append('option reslim=%s;' % remaining)
-            result = SolverFactory(config.minlp_solver).solve(subproblem, **minlp_args)
-            primal_improved = self._handle_subproblem_result(
-                result, subproblem, external_var_value, config, search_type
+            solver_result = SolverFactory(config.minlp_solver).solve(
+                subproblem, **minlp_args
             )
-            # Only retrieve primal_bound if the solve succeeded; otherwise return None
-            if primal_improved:
-                obj = next(subproblem.component_data_objects(Objective, active=True))
-                primal_bound = value(obj)
-            else:
-                primal_bound = None
-        return primal_improved, primal_bound
+
+        return self._collect_subproblem_result(
+            solver_result, subproblem, external_var_value
+        )
+
+    @staticmethod
+    def _infeasible_subproblem_result(external_var_value):
+        if external_var_value is not None:
+            external_var_value = tuple(external_var_value)
+        return SubproblemResult(
+            external_var_value=external_var_value,
+            feasible=False,
+            solver_bound=None,
+            model_objective=None,
+            continuous_soln=None,
+            boolean_soln=None,
+        )
+
+    def _collect_subproblem_result(self, solver_result, subproblem, external_var_value):
+        if solver_result is None:
+            return self._infeasible_subproblem_result(external_var_value)
+        if solver_result.solver.termination_condition not in {
+            tc.optimal,
+            tc.feasible,
+            tc.globallyOptimal,
+            tc.locallyOptimal,
+            tc.maxTimeLimit,
+            tc.maxIterations,
+            tc.maxEvaluations,
+        }:
+            return self._infeasible_subproblem_result(external_var_value)
+
+        solver_bound = (
+            solver_result.problem.upper_bound
+            if self.objective_sense == minimize
+            else solver_result.problem.lower_bound
+        )
+        obj = next(subproblem.component_data_objects(Objective, active=True))
+        util_block = subproblem.component(self.original_util_block.local_name)
+        model_objective = value(obj, exception=False)
+        continuous_soln = [
+            value(v, exception=False) for v in util_block.algebraic_variable_list
+        ]
+        boolean_soln = [
+            value(v, exception=False)
+            for v in util_block.transformed_boolean_variable_list
+        ]
+        if model_objective is None or any(
+            v is None for v in it.chain(continuous_soln, boolean_soln)
+        ):
+            return self._infeasible_subproblem_result(external_var_value)
+
+        return SubproblemResult(
+            external_var_value=tuple(external_var_value),
+            feasible=True,
+            solver_bound=solver_bound,
+            model_objective=model_objective,
+            continuous_soln=continuous_soln,
+            boolean_soln=boolean_soln,
+        )
+
+    def _integrate_subproblem_result(self, result, search_type, config):
+        if not result.feasible:
+            return False, None
+
+        primal_improved = self._update_bounds_after_solve(
+            search_type,
+            primal=result.solver_bound,
+            logger=config.logger,
+            current_point=result.external_var_value,
+        )
+        if primal_improved:
+            self.incumbent_continuous_soln = list(result.continuous_soln)
+            self.incumbent_boolean_soln = list(result.boolean_soln)
+            return True, result.model_objective
+        return False, None
 
     def get_external_information(self, util_block, config):
         """
@@ -383,9 +477,18 @@ class GDP_LDSDA_Solver(_GDPoptAlgorithm):
             The list of integer values representing the active disjunct index
             for each external variable.
         """
+        self._fix_disjunctions_on_util_block(
+            self.working_model_util_block, external_var_values_list
+        )
+        self.explored_point_set.add(tuple(external_var_values_list))
+
+    @staticmethod
+    def _fix_disjunctions_on_util_block(util_block, external_var_values_list):
+        """
+        Fix Boolean variables in a utility block for an external-variable point.
+        """
         for external_variable_value, external_var_info in zip(
-            external_var_values_list,
-            self.working_model_util_block.external_var_info_list,
+            external_var_values_list, util_block.external_var_info_list
         ):
             for idx, boolean_var in enumerate(external_var_info.Boolean_vars):
                 if idx == external_variable_value - 1:
@@ -396,7 +499,6 @@ class GDP_LDSDA_Solver(_GDPoptAlgorithm):
                     boolean_var.fix(False)
                     if boolean_var.get_associated_binary() is not None:
                         boolean_var.get_associated_binary().fix(0)
-        self.explored_point_set.add(tuple(external_var_values_list))
 
     def _get_directions(self, dimension, config):
         """
@@ -552,63 +654,6 @@ class GDP_LDSDA_Solver(_GDPoptAlgorithm):
                     break
             else:
                 break
-
-    def _handle_subproblem_result(
-        self, subproblem_result, subproblem, external_var_value, config, search_type
-    ):
-        """
-        Process the result of a subproblem solve.
-
-        Checks termination conditions, updates primal bounds if valid, and
-        logs the state.
-
-        Parameters
-        ----------
-        subproblem_result : SolverResults
-            The result object returned by the solver.
-        subproblem : ConcreteModel
-            The subproblem model instance.
-        external_var_value : tuple
-            The external variable configuration used for this subproblem.
-        config : ConfigBlock
-            The configuration block.
-        search_type : SearchPhase
-            The type of search (SearchPhase.NEIGHBOR, etc.).
-
-        Returns
-        -------
-        bool
-            True if the result improved the current best primal bound,
-            False otherwise.
-        """
-        if subproblem_result is None:
-            return False
-        if subproblem_result.solver.termination_condition in {
-            tc.optimal,
-            tc.feasible,
-            tc.globallyOptimal,
-            tc.locallyOptimal,
-            tc.maxTimeLimit,
-            tc.maxIterations,
-            tc.maxEvaluations,
-        }:
-            primal_bound = (
-                subproblem_result.problem.upper_bound
-                if self.objective_sense == minimize
-                else subproblem_result.problem.lower_bound
-            )
-            primal_improved = self._update_bounds_after_solve(
-                search_type,
-                primal=primal_bound,
-                logger=config.logger,
-                current_point=external_var_value,
-            )
-            if primal_improved:
-                self.update_incumbent(
-                    subproblem.component(self.original_util_block.name)
-                )
-            return primal_improved
-        return False
 
     def _log_header(self, logger):
         logger.info(
