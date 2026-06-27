@@ -322,6 +322,72 @@ class TestLDSDAUnits(unittest.TestCase):
         self.assertEqual(solver.explored_point_set, set())
         self.assertTrue(all(not var.fixed for var in working_bools))
 
+    def test_collect_feasible_subproblem_result_extracts_solution(self):
+        """
+        Test feasible result collection without requiring an external solver.
+        """
+        model = ConcreteModel()
+        model.x = Var(initialize=1.25)
+        model.d1 = Disjunct()
+        model.d2 = Disjunct()
+        model.disj = Disjunction(expr=[model.d1, model.d2])
+        model.obj = Objective(expr=model.x)
+
+        solver = GDP_LDSDA_Solver()
+        solver.pyomo_results = SolverResults()
+        solver.pyomo_results.problem.sense = minimize
+
+        util_block = solver.original_util_block = add_util_block(model)
+        add_disjunct_list(util_block)
+        add_algebraic_variable_list(util_block)
+        add_boolean_variable_lists(util_block)
+        TransformationFactory('core.logical_to_linear').apply_to(model)
+        add_transformed_boolean_variable_list(util_block)
+        util_block.transformed_boolean_variable_list[0].set_value(1)
+        util_block.transformed_boolean_variable_list[1].set_value(0)
+
+        solver_result = SolverResults()
+        solver_result.solver.termination_condition = tc.optimal
+        solver_result.problem.upper_bound = 1.5
+
+        result = solver._collect_subproblem_result(solver_result, model, (1,))
+
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.external_var_value, (1,))
+        self.assertEqual(result.solver_bound, 1.5)
+        self.assertEqual(result.model_objective, 1.25)
+        self.assertEqual(result.continuous_soln, [1.25])
+        self.assertEqual(result.boolean_soln, [1, 0])
+
+    def test_collect_subproblem_result_without_loaded_solution_is_infeasible(self):
+        """
+        Test accepted terminations without primal values do not raise.
+        """
+        model = ConcreteModel()
+        model.x = Var()
+        model.obj = Objective(expr=model.x)
+
+        solver = GDP_LDSDA_Solver()
+        solver.pyomo_results = SolverResults()
+        solver.pyomo_results.problem.sense = minimize
+
+        util_block = solver.original_util_block = add_util_block(model)
+        add_disjunct_list(util_block)
+        add_algebraic_variable_list(util_block)
+        add_boolean_variable_lists(util_block)
+        add_transformed_boolean_variable_list(util_block)
+
+        solver_result = SolverResults()
+        solver_result.solver.termination_condition = tc.maxTimeLimit
+        solver_result.problem.upper_bound = 2.0
+
+        result = solver._collect_subproblem_result(solver_result, model, (1,))
+
+        self.assertFalse(result.feasible)
+        self.assertEqual(result.external_var_value, (1,))
+        self.assertIsNone(result.model_objective)
+        self.assertIsNone(result.continuous_soln)
+
     def test_integrate_feasible_subproblem_result_updates_incumbent(self):
         """
         Test that the coordinator updates bounds and incumbent values.
@@ -380,43 +446,30 @@ class TestLDSDAUnits(unittest.TestCase):
         self.assertEqual(solver.incumbent_continuous_soln, [9])
         self.assertEqual(solver.incumbent_boolean_soln, [0])
 
-    def test_handle_subproblem_result_none(self):
+    def test_collect_subproblem_result_none(self):
         """
         Test handling of None results from subproblems.
 
-        Verifies that `_handle_subproblem_result` returns False (indicating
-        no improvement) if the subproblem solver returns None.
+        Verifies that `_collect_subproblem_result` returns an infeasible worker
+        result if the subproblem solver returns None.
         """
-        result = self.solver._handle_subproblem_result(
-            None, (False, None), None, None, None
-        )
-        self.assertFalse(result)
+        result = self.solver._collect_subproblem_result(None, None, None)
+        self.assertFalse(result.feasible)
 
-    def test_handle_subproblem_result_termination_failure(self):
+    def test_collect_subproblem_result_termination_failure(self):
         """
         Test handling of failed termination conditions.
 
-        Verifies that `_handle_subproblem_result` returns False if the solver
+        Verifies that `_collect_subproblem_result` returns False if the solver
         termination condition is not in the set of successful statuses
         (e.g., optimal, feasible).
         """
-        # 1. Create a mock result object
-        mock_result = MagicMock()
+        solver_result = SolverResults()
+        solver_result.solver.termination_condition = tc.error
 
-        # 2. Set termination condition to something NOT in the 'success' set
-        # The code checks for: optimal, feasible, globallyOptimal, locallyOptimal,
-        # maxTimeLimit, maxIterations, maxEvaluations.
-        # We use 'infeasible' or 'error' to trigger the False return.
-        mock_result.solver.termination_condition = tc.error
+        result = self.solver._collect_subproblem_result(solver_result, None, None)
 
-        # 3. Run the method
-        # We don't need real model objects for the other args since the code exits early
-        result = self.solver._handle_subproblem_result(
-            mock_result, None, None, None, None
-        )
-
-        # 4. Verify it returns False (because the solver failed)
-        self.assertFalse(result)
+        self.assertFalse(result.feasible)
 
 
 if __name__ == '__main__':

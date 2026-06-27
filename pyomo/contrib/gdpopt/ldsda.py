@@ -335,15 +335,26 @@ class GDP_LDSDA_Solver(_GDPoptAlgorithm):
         )
         obj = next(subproblem.component_data_objects(Objective, active=True))
         util_block = subproblem.component(self.original_util_block.local_name)
+        model_objective = value(obj, exception=False)
+        continuous_soln = [
+            value(v, exception=False) for v in util_block.algebraic_variable_list
+        ]
+        boolean_soln = [
+            value(v, exception=False)
+            for v in util_block.transformed_boolean_variable_list
+        ]
+        if model_objective is None or any(
+            v is None for v in it.chain(continuous_soln, boolean_soln)
+        ):
+            return self._infeasible_subproblem_result(external_var_value)
+
         return SubproblemResult(
             external_var_value=tuple(external_var_value),
             feasible=True,
             solver_bound=solver_bound,
-            model_objective=value(obj),
-            continuous_soln=[v.value for v in util_block.algebraic_variable_list],
-            boolean_soln=[
-                v.value for v in util_block.transformed_boolean_variable_list
-            ],
+            model_objective=model_objective,
+            continuous_soln=continuous_soln,
+            boolean_soln=boolean_soln,
         )
 
     def _integrate_subproblem_result(self, result, search_type, config):
@@ -643,44 +654,6 @@ class GDP_LDSDA_Solver(_GDPoptAlgorithm):
                     break
             else:
                 break
-
-    def _handle_subproblem_result(
-        self, subproblem_result, subproblem, external_var_value, config, search_type
-    ):
-        """
-        Process the result of a subproblem solve.
-
-        Checks termination conditions, updates primal bounds if valid, and
-        logs the state.
-
-        Parameters
-        ----------
-        subproblem_result : SolverResults
-            The result object returned by the solver.
-        subproblem : ConcreteModel
-            The subproblem model instance.
-        external_var_value : tuple
-            The external variable configuration used for this subproblem.
-        config : ConfigBlock
-            The configuration block.
-        search_type : SearchPhase
-            The type of search (SearchPhase.NEIGHBOR, etc.).
-
-        Returns
-        -------
-        bool
-            True if the result improved the current best primal bound,
-            False otherwise.
-        """
-        result = self._collect_subproblem_result(
-            subproblem_result, subproblem, external_var_value
-        )
-        if not result.feasible:
-            return False
-        primal_improved, _ = self._integrate_subproblem_result(
-            result, search_type, config
-        )
-        return primal_improved
 
     def _log_header(self, logger):
         logger.info(
