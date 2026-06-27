@@ -16,14 +16,24 @@ from pyomo.environ import (
     BooleanVar,
     LogicalConstraint,
     Block,
+    Objective,
+    minimize,
 )
 from pyomo.gdp import Disjunct, Disjunction
 import pyomo.common.unittest as unittest
+from pyomo.contrib.gdpopt.create_oa_subproblems import (
+    add_util_block,
+    add_disjunct_list,
+    add_disjunction_list,
+    add_algebraic_variable_list,
+    add_boolean_variable_lists,
+    add_transformed_boolean_variable_list,
+)
 from pyomo.contrib.gdpopt.tests.four_stage_dynamic_model import build_model
 from unittest.mock import MagicMock
 from pyomo.core.expr.logical_expr import exactly
-from pyomo.contrib.gdpopt.ldsda import GDP_LDSDA_Solver
-from pyomo.opt import TerminationCondition as tc
+from pyomo.contrib.gdpopt.ldsda import GDP_LDSDA_Solver, SearchPhase, SubproblemResult
+from pyomo.opt import SolverResults, TerminationCondition as tc
 
 
 class TestGDPoptLDSDA(unittest.TestCase):
@@ -258,6 +268,117 @@ class TestLDSDAUnits(unittest.TestCase):
 
         # It should pick (1,1) because it is further away (Tiebreaker rule)
         self.assertEqual(self.solver.current_point, (1, 1))
+
+    def test_build_and_solve_subproblem_does_not_mutate_working_model(self):
+        """
+        Test that the worker-side evaluation fixes disjunctions only on a clone.
+        """
+        model = ConcreteModel()
+        model.x = Var(bounds=(0, 1), initialize=0)
+        model.d1 = Disjunct()
+        model.d1.c = Constraint(expr=model.x <= -1)
+        model.d2 = Disjunct()
+        model.d2.c = Constraint(expr=model.x >= 0)
+        model.disj = Disjunction(expr=[model.d1, model.d2])
+        model.obj = Objective(expr=model.x)
+
+        solver = GDP_LDSDA_Solver()
+        solver.pyomo_results = SolverResults()
+        solver.pyomo_results.problem.sense = minimize
+        solver.explored_point_set = set()
+
+        util_block = solver.original_util_block = add_util_block(model)
+        add_disjunct_list(util_block)
+        add_algebraic_variable_list(util_block)
+        add_boolean_variable_lists(util_block)
+
+        solver.working_model = model.clone()
+        solver.working_model_util_block = solver.working_model.component(
+            util_block.local_name
+        )
+        add_disjunction_list(solver.working_model_util_block)
+        TransformationFactory('core.logical_to_linear').apply_to(solver.working_model)
+        add_transformed_boolean_variable_list(solver.working_model_util_block)
+
+        config = solver.CONFIG()
+        config.starting_point = [1]
+        config.disjunction_list = [solver.working_model.disj]
+        config.logical_constraint_list = None
+        solver.working_model_util_block.config_disjunction_list = [
+            solver.working_model.disj
+        ]
+
+        solver.get_external_information(solver.working_model_util_block, config)
+        working_bools = [
+            info.Boolean_vars[0]
+            for info in solver.working_model_util_block.external_var_info_list
+        ]
+        self.assertTrue(all(not var.fixed for var in working_bools))
+
+        result = solver._build_and_solve_subproblem((1,), config)
+
+        self.assertFalse(result.feasible)
+        self.assertEqual(result.external_var_value, (1,))
+        self.assertEqual(solver.explored_point_set, set())
+        self.assertTrue(all(not var.fixed for var in working_bools))
+
+    def test_integrate_feasible_subproblem_result_updates_incumbent(self):
+        """
+        Test that the coordinator updates bounds and incumbent values.
+        """
+        solver = GDP_LDSDA_Solver()
+        solver.pyomo_results = SolverResults()
+        solver.pyomo_results.problem.sense = minimize
+
+        result = SubproblemResult(
+            external_var_value=(2,),
+            feasible=True,
+            solver_bound=5.0,
+            model_objective=4.5,
+            continuous_soln=[1.25],
+            boolean_soln=[1, 0],
+        )
+        config = type('Config', (), {'logger': None})()
+
+        primal_improved, primal_bound = solver._integrate_subproblem_result(
+            result, SearchPhase.NEIGHBOR, config
+        )
+
+        self.assertTrue(primal_improved)
+        self.assertEqual(primal_bound, 4.5)
+        self.assertEqual(solver.UB, 5.0)
+        self.assertEqual(solver.incumbent_continuous_soln, [1.25])
+        self.assertEqual(solver.incumbent_boolean_soln, [1, 0])
+
+    def test_integrate_infeasible_subproblem_result_is_noop(self):
+        """
+        Test that infeasible worker results do not update coordinator state.
+        """
+        solver = GDP_LDSDA_Solver()
+        solver.pyomo_results = SolverResults()
+        solver.pyomo_results.problem.sense = minimize
+        solver.incumbent_continuous_soln = [9]
+        solver.incumbent_boolean_soln = [0]
+
+        result = SubproblemResult(
+            external_var_value=(1,),
+            feasible=False,
+            solver_bound=None,
+            model_objective=None,
+            continuous_soln=None,
+            boolean_soln=None,
+        )
+        config = type('Config', (), {'logger': None})()
+
+        primal_improved, primal_bound = solver._integrate_subproblem_result(
+            result, SearchPhase.NEIGHBOR, config
+        )
+
+        self.assertFalse(primal_improved)
+        self.assertIsNone(primal_bound)
+        self.assertEqual(solver.UB, float('inf'))
+        self.assertEqual(solver.incumbent_continuous_soln, [9])
+        self.assertEqual(solver.incumbent_boolean_soln, [0])
 
     def test_handle_subproblem_result_none(self):
         """
