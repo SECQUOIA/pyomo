@@ -13,6 +13,7 @@ from io import StringIO
 import logging
 from math import fabs
 from os.path import abspath, dirname, join, normpath
+from unittest.mock import patch
 
 import pyomo.common.unittest as unittest
 
@@ -57,19 +58,14 @@ class TestGDPopt_LBB_TimeLimit(unittest.TestCase):
         m.disj = Disjunction(expr=[m.d1, m.d2])
         m.obj = Objective(expr=m.x)
 
-        orig_reached_time_limit = GDP_LBB_Solver.reached_time_limit
-
         def force_time_limit(solver, config):
             solver.pyomo_results.solver.termination_condition = (
                 TerminationCondition.maxTimeLimit
             )
             return True
 
-        GDP_LBB_Solver.reached_time_limit = force_time_limit
-        try:
+        with patch.object(GDP_LBB_Solver, 'reached_time_limit', new=force_time_limit):
             results = SolverFactory('gdpopt.lbb').solve(m, time_limit=1, tee=False)
-        finally:
-            GDP_LBB_Solver.reached_time_limit = orig_reached_time_limit
 
         self.assertEqual(
             results.solver.termination_condition, TerminationCondition.maxTimeLimit
