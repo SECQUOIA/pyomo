@@ -61,16 +61,8 @@ def _quadratic_matrix(repn):
     return q_matrix
 
 
-def symmetric_matrix_eigenvalues(matrix):
-    """Return the eigenvalues of a real symmetric matrix.
-
-    Uses NumPy when it is available. Otherwise falls back to a cyclic Jacobi
-    iteration so that curvature classification still works in environments
-    without NumPy. Returns None if the Jacobi iteration does not converge.
-    """
-    if numpy_available:
-        return np.linalg.eigvalsh(matrix)
-
+def _jacobi_eigenvalues(matrix):
+    """Return symmetric-matrix eigenvalues using cyclic Jacobi iteration."""
     order = len(matrix)
     if order <= 1:
         return [matrix[0][0]] if order else []
@@ -117,6 +109,18 @@ def symmetric_matrix_eigenvalues(matrix):
             matrix[k][pivot_j] = matrix[pivot_j][k] = sine * elem_i + cosine * elem_j
 
     return None
+
+
+def symmetric_matrix_eigenvalues(matrix):
+    """Return the eigenvalues of a real symmetric matrix.
+
+    Uses NumPy when it is available. Otherwise falls back to a cyclic Jacobi
+    iteration so that curvature classification still works in environments
+    without NumPy. Returns None if the Jacobi iteration does not converge.
+    """
+    if numpy_available:
+        return np.linalg.eigvalsh(matrix)
+    return _jacobi_eigenvalues(matrix)
 
 
 def quadratic_curvature(expr):
