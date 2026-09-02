@@ -8,6 +8,7 @@
 # ____________________________________________________________________________________
 
 
+import logging
 from unittest.mock import MagicMock, patch
 
 from pyomo.common import timing
@@ -461,7 +462,7 @@ class TestMindtPyGOATimeLimit(unittest.TestCase):
     def test_goa_time_limit_sets_solver_results_condition(self):
         solver = MindtPy_GOA_Solver()
         solver.config = _SimpleNamespace(
-            logger=MagicMock(), single_tree=False, time_limit=1
+            logger=logging.getLogger(__name__), single_tree=False, time_limit=1
         )
         solver.results = SolverResults()
         solver.timing = _SimpleNamespace(
