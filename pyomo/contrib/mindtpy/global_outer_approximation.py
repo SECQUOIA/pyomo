@@ -35,8 +35,8 @@ class MindtPy_GOA_Solver(_MindtPyAlgorithm):
     """
 
     CONFIG = _get_MindtPy_GOA_config()
-    # GOA relaxes the nonlinear constraints with McCormick envelopes, which is a
-    # valid relaxation of nonconvex problems, so its dual bound is rigorous.
+    # McCormick envelopes provide a valid relaxation without requiring the
+    # original model to be convex.
 
     def check_config(self):
         config = self.config

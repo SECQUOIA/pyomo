@@ -14,9 +14,7 @@ from pyomo.common.config import ConfigBlock
 from pyomo.common.errors import DeveloperError
 from pyomo.common.modeling import unique_component_name
 from pyomo.contrib.gdpopt.config_options import _add_common_configs
-from pyomo.contrib.gdpopt.nonrigorous_bounds import (
-    model_may_have_nonrigorous_dual_bound,
-)
+from pyomo.contrib.gdpopt.convexity import model_is_not_certified_convex
 from pyomo.contrib.gdpopt.create_oa_subproblems import (
     add_util_block,
     add_disjunct_list,
@@ -40,7 +38,7 @@ from pyomo.util.model_size import build_model_size_report
 class _GDPoptAlgorithm:
     CONFIG = ConfigBlock("GDPopt")
     _add_common_configs(CONFIG)
-    _crossed_bounds_are_certified = True
+    _requires_model_convexity = False
 
     def __init__(self, **kwds):
         """
@@ -61,8 +59,8 @@ class _GDPoptAlgorithm:
 
         self.incumbent_boolean_soln = None
         self.incumbent_continuous_soln = None
-        self._nonrigorous_crossed_bounds = False
-        self._nonrigorous_dual_bound_possible = False
+        self._bounds_crossed_without_certified_convexity = False
+        self._model_is_not_certified_convex = False
 
         self.original_obj = None
         self._dummy_obj = None
@@ -119,8 +117,8 @@ class _GDPoptAlgorithm:
 
         config = self.config(kwds.pop('options', {}), preserve_implicit=True)
         config.set_value(kwds)
-        self._nonrigorous_crossed_bounds = False
-        self._nonrigorous_dual_bound_possible = False
+        self._bounds_crossed_without_certified_convexity = False
+        self._model_is_not_certified_convex = False
 
         with lower_logger_level_to(config.logger, tee=config.tee):
             self._log_solver_intro_message(config)
@@ -215,8 +213,9 @@ class _GDPoptAlgorithm:
         logger = config.logger
 
         self._create_pyomo_results_object_with_problem_info(model, config)
-        self._nonrigorous_dual_bound_possible = (
-            self._problem_may_have_nonrigorous_dual_bound(model)
+        self._model_is_not_certified_convex = (
+            self._requires_model_convexity
+            and model_is_not_certified_convex(model, config.eigenvalue_tolerance)
         )
         # Check if this problem actually has any discrete decisions. If not,
         # just solve it.
@@ -363,17 +362,6 @@ class _GDPoptAlgorithm:
         else:
             self._update_bounds(dual=float('-inf'))
 
-    def _problem_may_have_nonrigorous_dual_bound(self, model):
-        """Return True if this algorithm's dual bound for `model` may not be rigorous.
-
-        Algorithms whose crossed bounds are certified build a valid relaxation for
-        any model, so their dual bounds are always rigorous. For the others, the
-        dual bound is only rigorous when the model can be certified convex.
-        """
-        if self._crossed_bounds_are_certified:
-            return False
-        return model_may_have_nonrigorous_dual_bound(model)
-
     def _update_primal_bound_to_unbounded(self, config):
         if self.objective_sense == minimize:
             self._update_bounds(primal=float('-inf'))
@@ -396,13 +384,13 @@ class _GDPoptAlgorithm:
                 self._load_infeasible_termination_status(config)
             elif (
                 self.LB > self.UB
-                and not self._crossed_bounds_are_certified
-                and self._nonrigorous_dual_bound_possible
+                and self._requires_model_convexity
+                and self._model_is_not_certified_convex
             ):
-                self._nonrigorous_crossed_bounds = True
+                self._bounds_crossed_without_certified_convexity = True
                 self._log_current_state(config.logger, '')
                 config.logger.info(
-                    'GDPopt exiting--bounds crossed without a certified dual bound.'
+                    'GDPopt exiting--bounds crossed without certified model convexity.'
                 )
                 self.pyomo_results.solver.termination_condition = tc.feasible
             else:
@@ -551,7 +539,7 @@ class _GDPoptAlgorithm:
         """
         results = self.pyomo_results
         # Finalize results object
-        if self._nonrigorous_crossed_bounds:
+        if self._bounds_crossed_without_certified_convexity:
             if self.objective_sense is minimize:
                 results.problem.lower_bound = float('-inf')
                 results.problem.upper_bound = self.UB

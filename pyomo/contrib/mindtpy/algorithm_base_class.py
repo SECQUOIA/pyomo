@@ -55,9 +55,7 @@ from pyomo.contrib.gdpopt.util import (
 from pyomo.contrib.gdpopt.solve_discrete_problem import (
     distinguish_mip_infeasible_or_unbounded,
 )
-from pyomo.contrib.gdpopt.nonrigorous_bounds import (
-    model_may_have_nonrigorous_dual_bound,
-)
+from pyomo.contrib.gdpopt.convexity import model_is_not_certified_convex
 from pyomo.contrib.mindtpy.util import (
     generate_norm1_objective_function,
     generate_norm2sq_objective_function,
@@ -87,19 +85,9 @@ egb, egb_available = attempt_import(
 
 
 class _MindtPyAlgorithm:
-    # Whether this algorithm's dual bound is a rigorous bound for any model it
-    # accepts. Algorithms that relax the nonlinear constraints with McCormick
-    # envelopes (GOA) build a valid relaxation of nonconvex problems and so are
-    # certified. Algorithms that linearize at trial points (OA, ECP) only produce
-    # a valid relaxation when the model is convex, so they set this to False and
-    # the model structure is checked before crossed bounds are trusted.
-    _crossed_bounds_are_certified = True
-
-    def _problem_may_have_nonrigorous_dual_bound(self, model):
-        """Return True if this algorithm's dual bound for `model` may not be rigorous."""
-        if self._crossed_bounds_are_certified:
-            return False
-        return model_may_have_nonrigorous_dual_bound(model)
+    # OA and ECP need a convex model for their linearizations to provide a valid
+    # relaxation. GOA uses McCormick envelopes and does not have this requirement.
+    _requires_model_convexity = False
 
     def __init__(self, **kwds):
         """
@@ -121,8 +109,8 @@ class _MindtPyAlgorithm:
         self.timing = Bunch()
         self.curr_int_sol = []
         self.should_terminate = False
-        self._nonrigorous_crossed_bounds = False
-        self._nonrigorous_dual_bound_possible = False
+        self._bounds_crossed_without_certified_convexity = False
+        self._model_is_not_certified_convex = False
         self.integer_list = []
         # Dictionary {integer solution (tuple): [cuts begin index, cuts end index] (list)}
         self.integer_solution_to_cuts_index = dict()
@@ -2470,7 +2458,7 @@ class _MindtPyAlgorithm:
             )
 
     def update_result(self):
-        if self._nonrigorous_crossed_bounds:
+        if self._bounds_crossed_without_certified_convexity:
             if self.objective_sense == minimize:
                 self.results.problem.lower_bound = float('-inf')
                 self.results.problem.upper_bound = self.primal_bound
@@ -3058,8 +3046,8 @@ class _MindtPyAlgorithm:
             kwds.pop('options', {}), preserve_implicit=True
         )
         config.set_value(kwds)
-        self._nonrigorous_crossed_bounds = False
-        self._nonrigorous_dual_bound_possible = False
+        self._bounds_crossed_without_certified_convexity = False
+        self._model_is_not_certified_convex = False
         self.set_up_logger()
         new_logging_level = logging.INFO if config.tee else None
         with lower_logger_level_to(config.logger, new_logging_level):
@@ -3087,8 +3075,11 @@ class _MindtPyAlgorithm:
                 self.results.problem.number_of_objectives = (
                     self._original_model_num_active_objectives
                 )
-                self._nonrigorous_dual_bound_possible = (
-                    self._problem_may_have_nonrigorous_dual_bound(self.original_model)
+                self._model_is_not_certified_convex = (
+                    self._requires_model_convexity
+                    and model_is_not_certified_convex(
+                        self.original_model, config.eigenvalue_tolerance
+                    )
                 )
 
                 # Validate the model to ensure that MindtPy is able to solve it.
@@ -3382,12 +3373,12 @@ class _MindtPyAlgorithm:
         # Check bound convergence
         if (
             self.abs_gap < 0
-            and not self._crossed_bounds_are_certified
-            and self._nonrigorous_dual_bound_possible
+            and self._requires_model_convexity
+            and self._model_is_not_certified_convex
         ):
-            self._nonrigorous_crossed_bounds = True
+            self._bounds_crossed_without_certified_convexity = True
             self.config.logger.info(
-                'MindtPy exiting on crossed bounds without a certified dual bound.'
+                'MindtPy exiting on crossed bounds without certified model convexity.'
             )
             self.results.solver.termination_condition = tc.feasible
             return True

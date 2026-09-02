@@ -266,7 +266,7 @@ class _SimpleNamespace:
             object.__setattr__(self, k, v)
 
 
-def _crossed_bound_solver(solver, nonrigorous_dual_bound_possible):
+def _crossed_bound_solver(solver, model_is_not_certified_convex):
     """Set up a solver instance with maximization bounds that have crossed."""
     solver.config = solver.CONFIG()
     solver.config.absolute_bound_tolerance = 1e-6
@@ -277,7 +277,7 @@ def _crossed_bound_solver(solver, nonrigorous_dual_bound_possible):
     solver.primal_bound = 1011.6577899409375
     solver.dual_bound = 1000.0
     solver.best_solution_found = object()
-    solver._nonrigorous_dual_bound_possible = nonrigorous_dual_bound_possible
+    solver._model_is_not_certified_convex = model_is_not_certified_convex
     solver.update_gap()
     return solver
 
@@ -340,32 +340,14 @@ class TestMindtPyCrossedBoundResults(unittest.TestCase):
         self.assertTrue(solver.bounds_converged())
         self.assertIs(solver.results.solver.termination_condition, tc.optimal)
 
-    def test_algorithm_bound_certification_flags(self):
+    def test_algorithm_convexity_requirements(self):
         from pyomo.contrib.mindtpy.outer_approximation import MindtPy_OA_Solver
         from pyomo.contrib.mindtpy.extended_cutting_plane import MindtPy_ECP_Solver
         from pyomo.contrib.mindtpy.global_outer_approximation import MindtPy_GOA_Solver
 
-        self.assertFalse(MindtPy_OA_Solver._crossed_bounds_are_certified)
-        self.assertFalse(MindtPy_ECP_Solver._crossed_bounds_are_certified)
-        self.assertTrue(MindtPy_GOA_Solver._crossed_bounds_are_certified)
-
-    def test_certified_algorithm_skips_model_structure_check(self):
-        """GOA should not pay for the convexity scan, since it cannot need it."""
-        from pyomo.contrib.mindtpy.global_outer_approximation import MindtPy_GOA_Solver
-        from pyomo.contrib.mindtpy.outer_approximation import MindtPy_OA_Solver
-
-        nonconvex = ConcreteModel()
-        nonconvex.x = Var(bounds=(-2, 2))
-        nonconvex.y = Var(bounds=(-2, 2))
-        nonconvex.c = Constraint(expr=nonconvex.x * nonconvex.y <= 1)
-        nonconvex.obj = Objective(expr=nonconvex.y)
-
-        self.assertFalse(
-            MindtPy_GOA_Solver()._problem_may_have_nonrigorous_dual_bound(nonconvex)
-        )
-        self.assertTrue(
-            MindtPy_OA_Solver()._problem_may_have_nonrigorous_dual_bound(nonconvex)
-        )
+        self.assertTrue(MindtPy_OA_Solver._requires_model_convexity)
+        self.assertTrue(MindtPy_ECP_Solver._requires_model_convexity)
+        self.assertFalse(MindtPy_GOA_Solver._requires_model_convexity)
 
 
 class TestMirrorDirectSolveResults(unittest.TestCase):
